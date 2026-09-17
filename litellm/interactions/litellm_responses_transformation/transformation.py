@@ -6,6 +6,7 @@ This module handles transforming between:
 - Responses API format (OpenAI's format with input[], instructions, etc.)
 """
 
+import base64
 from typing import Any, Final, cast
 
 from litellm.types.interactions import (
@@ -17,6 +18,13 @@ from litellm.types.interactions import (
 from litellm.types.llms.openai import (
     ResponseInputParam,
     ResponsesAPIResponse,
+)
+
+_IMAGE_MAGIC_BYTES: Final[tuple[tuple[bytes, str], ...]] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
 )
 
 
@@ -171,6 +179,9 @@ class LiteLLMResponsesInteractionsConfig:
         transformed: Final[list[dict[str, Any]]] = []
         for item in content:
             if isinstance(item, dict):
+                if item.get("type") == "image":
+                    transformed.append(LiteLLMResponsesInteractionsConfig._transform_image_content_item(item))
+                    continue
                 # Already in dict format, pass through
                 transformed.append(item)
             elif isinstance(item, str):
@@ -197,6 +208,45 @@ class LiteLLMResponsesInteractionsConfig:
                     transformed.append({"type": "text", "text": str(item)})
 
         return transformed
+
+    @staticmethod
+    def _transform_image_content_item(item: dict[str, Any]) -> dict[str, Any]:
+        """
+        Gemini's Interactions API image part ({"type": "image", "data": <base64>,
+        "mime_type": ...} or {"uri": ...}) is not a Responses API content type
+        (input_text/input_image/input_file) and is silently dropped downstream if
+        passed through unchanged. Map it to a Responses API `input_image` part.
+        """
+        uri = item.get("uri")
+        if isinstance(uri, str) and uri:
+            return {"type": "input_image", "image_url": uri}
+
+        data = item.get("data")
+        if isinstance(data, str) and data:
+            mime_type = (
+                item.get("mime_type")
+                or LiteLLMResponsesInteractionsConfig._sniff_image_mime_type(data)
+                or "application/octet-stream"
+            )
+            return {"type": "input_image", "image_url": f"data:{mime_type};base64,{data}"}
+
+        return item
+
+    @staticmethod
+    def _sniff_image_mime_type(data: str) -> str | None:
+        prefix_len = (min(len(data), 24) // 4) * 4
+        if prefix_len == 0:
+            return None
+        try:
+            prefix = base64.b64decode(data[:prefix_len])
+        except ValueError:
+            return None
+        for magic, mime in _IMAGE_MAGIC_BYTES:
+            if prefix.startswith(magic):
+                return mime
+        if prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP":
+            return "image/webp"
+        return None
 
     @staticmethod
     def transform_responses_response_to_interactions_response(
